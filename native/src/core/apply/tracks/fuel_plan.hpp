@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -81,6 +82,19 @@ inline std::string set_masks(const std::vector<const fuel::Set *> &sets)
         out += b;
     }
     return out;
+}
+
+// Whether an addon set a track.data record's fuel.burn_per_lap: the record is an addon's own (its owner isn't the
+// game), or an addon's layer or variant left an origin on the field or on a field above it. A seeded record no addon
+// changed is the game's and has none, and must not overwrite the live value.
+inline bool burn_from_addon(const std::map<std::string, std::string> &origins, const std::string &owner = "game")
+{
+    if (!owner.empty() && owner != "game")
+        return true;
+    for (auto &[p, addon] : origins)
+        if (!addon.empty() && (p.empty() || p == "/fuel" || p == "/fuel/burn_per_lap"))
+            return true;
+    return false;
 }
 
 inline void plan_burn(std::vector<FuelWrite> &out, const fuel::Set &set, const std::string &code, float burn,
