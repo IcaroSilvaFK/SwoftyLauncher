@@ -1629,8 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_table_takes_an_id_ids_json_holds_for_an_addon_the_build_leaves_out_even_one_a_career_listed()
-    {
+    fn a_full_table_takes_an_id_ids_json_holds_for_an_addon_the_build_leaves_out_even_one_a_career_listed() {
         let data = data_dir("registry-full");
         let records: Vec<String> = (1..=254).map(|id| format!(r#""gone.x/pkg_{id}":{id}"#)).collect();
         put(
@@ -1694,7 +1693,10 @@ mod tests {
         let labels: Vec<String> = (1..=10).map(|i| format!("p{i}")).collect();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let built = build(PACKAGES, 0, &[("cs", &refs)], store);
-        assert_eq!(built.ids.values().copied().collect::<BTreeSet<_>>(), (1..=10).collect());
+        assert_eq!(
+            built.ids.values().copied().collect::<BTreeSet<_>>(),
+            (1..=10).collect()
+        );
         std::fs::remove_dir_all(&data).ok();
     }
 
