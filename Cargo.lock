@@ -4367,6 +4367,7 @@ dependencies = [
  "naga-types",
  "num-traits",
  "once_cell",
+ "petgraph",
  "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.21",
@@ -7034,7 +7035,7 @@ dependencies = [
 
 [[package]]
 name = "swofty-addon"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
  "semver",
  "serde",
@@ -7046,14 +7047,14 @@ dependencies = [
 
 [[package]]
 name = "swofty-builtins"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
  "swofty-addon",
 ]
 
 [[package]]
 name = "swofty-cli"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7065,11 +7066,12 @@ dependencies = [
  "swofty-builtins",
  "swofty-core",
  "swofty-formats",
+ "swofty-shaders",
 ]
 
 [[package]]
 name = "swofty-core"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
  "flate2",
  "libc",
@@ -7087,6 +7089,7 @@ dependencies = [
  "swofty-addon",
  "swofty-formats",
  "swofty-sdk",
+ "swofty-shaders",
  "tar",
  "thiserror 2.0.21",
  "tungstenite",
@@ -7098,7 +7101,7 @@ dependencies = [
 
 [[package]]
 name = "swofty-formats"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
  "aes 0.9.3",
  "bcdec_rs",
@@ -7109,14 +7112,20 @@ dependencies = [
 
 [[package]]
 name = "swofty-launcher"
-version = "1.7.29"
+version = "1.8.0"
 dependencies = [
+ "anyhow",
  "gpui-kit",
+ "image",
+ "lsp-types",
+ "png 0.18.1",
  "semver",
  "serde",
  "serde_json",
  "swofty-builtins",
  "swofty-core",
+ "swofty-preview",
+ "swofty-shaders",
  "ureq",
  "winresource",
 ]
@@ -7135,8 +7144,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "swofty-preview"
+version = "1.8.0"
+dependencies = [
+ "image",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "swofty-shaders",
+ "tempfile",
+ "ureq",
+ "wgpu",
+ "zip",
+]
+
+[[package]]
 name = "swofty-sdk"
-version = "1.7.29"
+version = "1.8.0"
+
+[[package]]
+name = "swofty-shaders"
+version = "1.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "syn"

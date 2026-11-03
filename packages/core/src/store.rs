@@ -201,6 +201,16 @@ impl Store {
         self.root.join("addons")
     }
 
+    /// Personal shader configs and the shader settings.
+    pub fn shaders_dir(&self) -> PathBuf {
+        self.root.join("shaders")
+    }
+
+    /// Compiled effects and the extracted effect library.
+    pub fn shaders_cache_dir(&self) -> PathBuf {
+        self.root.join("cache/shaders")
+    }
+
     pub fn addon_data_dir(&self, id: &str) -> PathBuf {
         self.root.join("addon-data").join(id)
     }
@@ -717,7 +727,15 @@ impl Store {
             };
             let listed = p.addons.iter().any(|a| a.id == id);
             let had_options = p.options.contains_key(id) || p.applied.contains_key(id);
-            if listed || had_options {
+            let shader = p.shader.as_deref().is_some_and(|r| {
+                r.strip_prefix("addon:")
+                    .and_then(|r| r.split_once('/'))
+                    .is_some_and(|(a, _)| a == id)
+            });
+            if listed || had_options || shader {
+                if shader {
+                    p.shader = None;
+                }
                 p.addons.retain(|a| a.id != id);
                 p.options.remove(id);
                 p.applied.remove(id);
