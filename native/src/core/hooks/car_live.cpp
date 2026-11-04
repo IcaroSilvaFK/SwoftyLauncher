@@ -79,6 +79,69 @@ constexpr Row ROWS[] = {
     {"PitStopInstance.car", false},
     {"Car_FuelEcu_SetMode_Thunk", true},
     {"EngineModeAvail.fuel", true},
+    {"site_Ai_BuildSystem_RecordPushed", true},
+    {"AiSystem.records_begin", true},
+    {"AiCarRecord.vehicle_index", true},
+    {"AiCarRecord.driver_config", true},
+    {"AiDriverConfig.blocking_fraction_of_follow_speed", true},
+    {"AiDriverConfig.blocking_fraction_of_follow_speed_at_race_start", true},
+    {"AiDriverConfig.blocking_max_blocking_distance", true},
+    {"AiDriverConfig.blocking_max_blocking_distance_at_race_start", true},
+    {"AiDriverConfig.alongside_speed_difference_for_limited_zone_yielding", true},
+    {"AiDriverConfig.alongside_yield_overtake_rate", true},
+    {"AiDriverConfig.alongside_min_presence_within_buffer", false},
+    {"AiDriverConfig.divebomb_defense_max_presence_alongside", false},
+    {"AiDriverConfig.divebomb_defense_max_time_to_ignore", false},
+    {"AiDriverConfig.divebomb_defense_max_track_offset", false},
+    {"AiDriverConfig.divebomb_defense_max_track_radius", false},
+    {"AiDriverConfig.offset_variation_max_offset", true},
+    {"AiDriverConfig.offset_variation_offset_limit_at_corner_start", true},
+    {"AiDriverConfig.offset_variation_offset_limit_blend_distance", true},
+    {"AiDriverConfig.offset_variation_half_width_scaling_graph", true},
+    {"AiDriverConfig.offset_variation_radius_scalar_graph", true},
+    {"AiDriverConfig.overtake_attacker_close_enough_car_lengths", true},
+    {"AiDriverConfig.overtake_braking_zone_abort_overtake_time", true},
+    {"AiDriverConfig.overtake_close_range_car_lengths_to_continue_overtake", true},
+    {"AiDriverConfig.overtake_close_range_car_lengths_to_start_overtake", true},
+    {"AiDriverConfig.overtake_oppertunist_overtake_time", true},
+    {"AiDriverConfig.overtake_oppertunist_overtake_track_speed_difference", false},
+    {"AiDriverConfig.overtake_danger_overtake_continue_time_adjustment", true},
+    {"AiDriverConfig.overtake_danger_overtake_full_heat_time_adjustment", false},
+    {"AiDriverConfig.overtake_danger_overtake_initiate_time_adjustment", true},
+    {"AiDriverConfig.overtake_danger_overtake_pull_out_time", true},
+    {"AiDriverConfig.overtake_regular_overtake_continue_time_adjustment", true},
+    {"AiDriverConfig.overtake_regular_overtake_full_heat_time_adjustment", false},
+    {"AiDriverConfig.overtake_regular_overtake_initiate_time_adjustment", true},
+    {"AiDriverConfig.overtake_regular_overtake_pull_out_time", true},
+    {"AiDriverConfig.overtake_overlap_percentage", true},
+    {"AiDriverConfig.overtake_concede_speed_diff", true},
+    {"AiDriverConfig.overtake_concede_slowdown_speed_diff", true},
+    {"AiDriverConfig.overtake_concede_time_vs_behind", true},
+    {"AiDriverConfig.space_seeking_added_buffer", true},
+    {"AiDriverConfig.space_seeking_speed_below_follow", true},
+    {"AiDriverConfig.space_seeking_first_speed_below_follow", true},
+    {"AiDriverConfig.space_seeking_car_in_front_needed", true},
+    {"AiDriverConfig.space_seeking_remember_crowed", false},
+    {"AiDriverConfig.space_seeking_concede_overtake_blocked_by_crowed_time", true},
+    {"AiDriverConfig.space_seeking_total_queue_needed", true},
+    {"AiDriverConfig.space_seeking_distance_braking_point", true},
+    {"AiDriverConfig.space_seeking_time_to_switch_sides", true},
+    {"AiDriverConfig.space_seeking_track_distance_needed", true},
+    {"AiDriverConfig.space_seeking_track_abort_distance", true},
+    {"AiDriverConfig.space_seeking_cars_moving_away_speed_to_ignore", true},
+    {"AiDriverConfig.space_seeking_can_start_track_radius", true},
+    {"AiDriverConfig.blocking_start_blocking_intersection_time", false},
+    {"AiDriverConfig.blocking_start_blocking_maximum_time_to_corner", true},
+    {"AiDriverConfig.blocking_start_blocking_minimum_time_to_corner", true},
+    {"AiDriverConfig.blocking_time_to_corner_for_end_merge_rate", true},
+    {"AiDriverConfig.blocking_time_to_corner_for_start_merge_rate", true},
+    {"AiDriverConfig.blocking_end_blocking_time_to_corner_vs_offset", true},
+    {"AiDriverConfig.blocking_blocking_offset_from_car_behind", true},
+    {"AiDriverConfig.blocking_blocking_speed_differential", true},
+    {"AiDriverConfig.blocking_blocking_threat_time_modifier", true},
+    {"AiDriverConfig.blocking_blocking_variable_offset_fraction", true},
+    {"AiDriverConfig.blocking_avoidance_decrease_rate", true},
+    {"AiDriverConfig.blocking_merge_back_to_racing_line", false},
 };
 
 bool row_ready(const char *name)
@@ -286,6 +349,7 @@ void frame(double, void *)
         g_epoch = facts->epoch;
     if (changed) {
         mem::invalidate();
+        Ops::racecraft_forget();
         uint32_t n = 0;
         if (Ops::op_count(&n) == SWOFTY_ASSET_OK)
             for (uint32_t i = 0; i < n; i++)
@@ -296,6 +360,7 @@ void frame(double, void *)
         mem::Trust trust(runtime::HEAP_TRUST_MS);
         perf::Scope scope(unlock_probe);
         Ops::unlock_tick();
+        Ops::racecraft_tick();
     }
     uint32_t profiled = 0, applied = 0;
     for (const auto &p : Ops::take_frame()) {
@@ -454,6 +519,7 @@ void arm_car_points()
 namespace {
 
 constexpr const char *LEVERS = "swofty_core.dll (car levers)";
+constexpr const char *RACECRAFT = "swofty_core.dll (ai racecraft)";
 bool g_levers_offered = false;
 
 void engine_torque(SwoftyContext *c)
@@ -464,6 +530,11 @@ void engine_torque(SwoftyContext *c)
                                                               swofty::mem::read(c->rbx + 0x2528, limiter);
                                                               return limiter;
                                                           }());
+}
+
+void ai_system_built(SwoftyContext *c)
+{
+    swofty_core::hooks::Ops::racecraft_pushed(c->rbx);
 }
 
 void ai_grip(SwoftyContext *c)
@@ -490,6 +561,15 @@ std::vector<CoreMixins> car_levers_mixins()
         mixins.push_back({"site_Ai_TableGripInput", SWOFTY_MIXIN_SITE, 100, (void *)&ai_grip, nullptr});
     else
         swofty::log("[cars] ai.grip_scale off: needs site_Ai_TableGripInput");
+    bool racecraft_rows = true;
+    for (const char *row : swofty_core::hooks::car_live::RACECRAFT_ROWS)
+        racecraft_rows = racecraft_rows && swofty_core::hooks::row_ready(row);
+    if (racecraft_rows && swofty::api->resolve("site_Ai_BuildSystem_RecordPushed"))
+        out.push_back({RACECRAFT,
+                       {{"site_Ai_BuildSystem_RecordPushed", SWOFTY_MIXIN_SITE, 50, (void *)&ai_system_built, nullptr}}});
+    else
+        swofty::log("[ai] ai.<group>.<key> fields off: need AiSystem.records_begin, AiCarRecord.vehicle_index and "
+                    "driver_config and site_Ai_BuildSystem_RecordPushed");
     if (!mixins.empty())
         out.push_back({LEVERS, std::move(mixins)});
     return out;

@@ -11,6 +11,8 @@
 
 #include <swofty_api.h>
 
+#include "ai_racecraft.hpp"
+
 // The core's live car operations (SwoftyCoreCarOps, standard library 1.6): cars::live reads and writes a
 // car's handling values while it is on track. A car is a slot of g_Sess_VehicleTable (its CarLive, whose
 // vehicle_id is the slot); each value is a field of one of the systems the car caches by section name at
@@ -33,7 +35,9 @@ constexpr uintptr_t FUEL_ECU_MODE = 0x128;
 constexpr uintptr_t MODE_AVAIL_FUEL = 0x28, MODE_AVAIL_STRIDE = 0x20;
 constexpr uint32_t MODE_AVAIL_CARS = 26;
 
-enum class Kind { plain, obf, virt };
+// cell: a per-car AI driver config float, int or curve behind a game database cell (ai_racecraft.hpp); vslot is its
+// index in ai_racecraft::DRIVER.
+enum class Kind { plain, obf, virt, cell };
 
 // What set re-runs after the write so the game's derived copy follows: the engine's derived values
 // (Car_Engine_ComputeDerived_Thunk), the gearbox's ratio table (Car_Tuning_SetFinalDrive with 0x20|0x2000, which
@@ -69,6 +73,10 @@ struct Field {
 
 inline constexpr float BIG = 1e9f;
 constexpr uintptr_t F1_AERO = 0x570, BRAKE_ECU = 0x550, CHASSIS = 0x558;
+
+#define AI_CELL(ID, GROUP, KEY, LO, HI)                                                                                \
+    {ID, "ai." #GROUP "." #KEY, 0, 0, Kind::cell, LO, HI, Rederive::none, Via::system, "AiDriverConfig." #GROUP "_" #KEY, \
+     0, false, ai_racecraft::slot(#GROUP "." #KEY)}
 
 inline constexpr Field FIELDS[] = {
     {SWOFTY_CAR_STEERING_LOCK, "steering.max_steering_lock", STEERING, 0x28, Kind::obf, 0.01f, 1.5708f},
@@ -191,7 +199,96 @@ inline constexpr Field FIELDS[] = {
      Via::system, "CarF1Aero.slipstream"},
     {SWOFTY_CAR_AERO_SLIPSTREAM_CAR_WIDTH, "aero.slipstream_car_width", F1_AERO, 0x128, Kind::obf, 0.1f, 10, Rederive::none,
      Via::system, "CarF1Aero.slipstream"},
+    // Version 5: the blocking evaluator's per-car config floats (ai_racecraft.hpp), read afresh on every AI tick.
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_FRACTION, blocking, fraction_of_follow_speed, 0.0f, 4.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_FRACTION_RACE_START, blocking, fraction_of_follow_speed_at_race_start, 0.0f, 4.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_MAX_DISTANCE, blocking, max_blocking_distance, 0.0f, 1000.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_MAX_DISTANCE_RACE_START,
+            blocking, max_blocking_distance_at_race_start, 0.0f, 1000.0f),
+    // Version 6: the rest of the driver config's float, int and curve slots (ai_racecraft.hpp DRIVER). A curve field
+    // is a flat curve at the composed value; get returns the curve at x = 0.
+    AI_CELL(SWOFTY_CAR_AI_ALONGSIDE_SPEED_DIFFERENCE_FOR_LIMITED_ZONE_YIELDING,
+            alongside, speed_difference_for_limited_zone_yielding, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_ALONGSIDE_YIELD_OVERTAKE_RATE, alongside, yield_overtake_rate, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_ALONGSIDE_MIN_PRESENCE_WITHIN_BUFFER, alongside, min_presence_within_buffer, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_DIVEBOMB_DEFENSE_MAX_PRESENCE_ALONGSIDE,
+            divebomb_defense, max_presence_alongside, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_DIVEBOMB_DEFENSE_MAX_TIME_TO_IGNORE, divebomb_defense, max_time_to_ignore, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_DIVEBOMB_DEFENSE_MAX_TRACK_OFFSET, divebomb_defense, max_track_offset, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_DIVEBOMB_DEFENSE_MAX_TRACK_RADIUS, divebomb_defense, max_track_radius, 0.0f, 10000.0f),
+    AI_CELL(SWOFTY_CAR_AI_OFFSET_VARIATION_MAX_OFFSET, offset_variation, max_offset, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_OFFSET_VARIATION_OFFSET_LIMIT_AT_CORNER_START,
+            offset_variation, offset_limit_at_corner_start, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_OFFSET_VARIATION_OFFSET_LIMIT_BLEND_DISTANCE,
+            offset_variation, offset_limit_blend_distance, 0.0f, 1000.0f),
+    AI_CELL(SWOFTY_CAR_AI_OFFSET_VARIATION_HALF_WIDTH_SCALING_GRAPH,
+            offset_variation, half_width_scaling_graph, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OFFSET_VARIATION_RADIUS_SCALAR_GRAPH, offset_variation, radius_scalar_graph, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_ATTACKER_CLOSE_ENOUGH_CAR_LENGTHS,
+            overtake, attacker_close_enough_car_lengths, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_BRAKING_ZONE_ABORT_OVERTAKE_TIME,
+            overtake, braking_zone_abort_overtake_time, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_CLOSE_RANGE_CAR_LENGTHS_TO_CONTINUE_OVERTAKE,
+            overtake, close_range_car_lengths_to_continue_overtake, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_CLOSE_RANGE_CAR_LENGTHS_TO_START_OVERTAKE,
+            overtake, close_range_car_lengths_to_start_overtake, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_OPPERTUNIST_OVERTAKE_TIME, overtake, oppertunist_overtake_time, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_OPPERTUNIST_OVERTAKE_TRACK_SPEED_DIFFERENCE,
+            overtake, oppertunist_overtake_track_speed_difference, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_DANGER_OVERTAKE_CONTINUE_TIME_ADJUSTMENT,
+            overtake, danger_overtake_continue_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_DANGER_OVERTAKE_FULL_HEAT_TIME_ADJUSTMENT,
+            overtake, danger_overtake_full_heat_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_DANGER_OVERTAKE_INITIATE_TIME_ADJUSTMENT,
+            overtake, danger_overtake_initiate_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_DANGER_OVERTAKE_PULL_OUT_TIME, overtake, danger_overtake_pull_out_time, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_REGULAR_OVERTAKE_CONTINUE_TIME_ADJUSTMENT,
+            overtake, regular_overtake_continue_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_REGULAR_OVERTAKE_FULL_HEAT_TIME_ADJUSTMENT,
+            overtake, regular_overtake_full_heat_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_REGULAR_OVERTAKE_INITIATE_TIME_ADJUSTMENT,
+            overtake, regular_overtake_initiate_time_adjustment, -100.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_REGULAR_OVERTAKE_PULL_OUT_TIME,
+            overtake, regular_overtake_pull_out_time, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_OVERLAP_PERCENTAGE, overtake, overlap_percentage, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_CONCEDE_SPEED_DIFF, overtake, concede_speed_diff, -500.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_CONCEDE_SLOWDOWN_SPEED_DIFF, overtake, concede_slowdown_speed_diff, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_OVERTAKE_CONCEDE_TIME_VS_BEHIND, overtake, concede_time_vs_behind, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_ADDED_BUFFER, space_seeking, added_buffer, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_SPEED_BELOW_FOLLOW, space_seeking, speed_below_follow, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_FIRST_SPEED_BELOW_FOLLOW,
+            space_seeking, first_speed_below_follow, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_CAR_IN_FRONT_NEEDED, space_seeking, car_in_front_needed, 0.0f, 32.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_REMEMBER_CROWED, space_seeking, remember_crowed, 0.0f, 600.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_CONCEDE_OVERTAKE_BLOCKED_BY_CROWED_TIME,
+            space_seeking, concede_overtake_blocked_by_crowed_time, 0.0f, 600.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_TOTAL_QUEUE_NEEDED, space_seeking, total_queue_needed, 0.0f, 32.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_DISTANCE_BRAKING_POINT, space_seeking, distance_braking_point, 0.0f, 1000.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_TIME_TO_SWITCH_SIDES, space_seeking, time_to_switch_sides, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_TRACK_DISTANCE_NEEDED, space_seeking, track_distance_needed, 0.0f, 1000.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_TRACK_ABORT_DISTANCE, space_seeking, track_abort_distance, 0.0f, 1000.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_CARS_MOVING_AWAY_SPEED_TO_IGNORE,
+            space_seeking, cars_moving_away_speed_to_ignore, 0.0f, 500.0f),
+    AI_CELL(SWOFTY_CAR_AI_SPACE_SEEKING_CAN_START_TRACK_RADIUS, space_seeking, can_start_track_radius, 0.0f, 10000.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_START_BLOCKING_INTERSECTION_TIME, blocking, start_blocking_intersection_time, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_START_BLOCKING_MAXIMUM_TIME_TO_CORNER, blocking, start_blocking_maximum_time_to_corner, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_START_BLOCKING_MINIMUM_TIME_TO_CORNER, blocking, start_blocking_minimum_time_to_corner, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_TIME_TO_CORNER_FOR_END_MERGE_RATE, blocking, time_to_corner_for_end_merge_rate, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_TIME_TO_CORNER_FOR_START_MERGE_RATE, blocking, time_to_corner_for_start_merge_rate, 0.0f, 60.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_END_BLOCKING_TIME_TO_CORNER_VS_OFFSET, blocking, end_blocking_time_to_corner_vs_offset, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_BLOCKING_OFFSET_FROM_CAR_BEHIND, blocking, blocking_offset_from_car_behind, 0.0f, 50.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_BLOCKING_SPEED_DIFFERENTIAL, blocking, blocking_speed_differential, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_BLOCKING_THREAT_TIME_MODIFIER, blocking, blocking_threat_time_modifier, -10.0f, 10.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_BLOCKING_VARIABLE_OFFSET_FRACTION, blocking, blocking_variable_offset_fraction, 0.0f, 1.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_AVOIDANCE_DECREASE_RATE, blocking, avoidance_decrease_rate, 0.0f, 100.0f),
+    AI_CELL(SWOFTY_CAR_AI_BLOCKING_MERGE_BACK_TO_RACING_LINE, blocking, merge_back_to_racing_line, 0.0f, 10.0f),
 };
+
+
+#undef AI_CELL
+
+inline constexpr const char *RACECRAFT_ROWS[] = {"AiSystem.records_begin", "AiCarRecord.vehicle_index",
+                                                 "AiCarRecord.driver_config", "site_Ai_BuildSystem_RecordPushed"};
 
 inline constexpr size_t FIELD_COUNT = sizeof FIELDS / sizeof FIELDS[0];
 
@@ -278,6 +375,7 @@ template <class Tag> struct Ops {
     static inline uint32_t next_token = 1;
     static inline uint64_t next_order = 0;
     static inline Slot slots[MAX_CARS][FIELD_COUNT];
+    static inline ai_racecraft::Fields racecraft;
     static inline std::atomic<float> virt[MAX_CARS][VIRTUALS];
     static inline std::atomic<bool> dirty{false}, power_active{false}, ai_active{false};
     static inline std::mutex slot_lock;
@@ -309,6 +407,7 @@ template <class Tag> struct Ops {
                     s = Slot{};
         }
         reset_virtuals();
+        racecraft.forget();
         dirty = false;
         std::lock_guard<std::mutex> g(pending_lock);
         pending.clear();
@@ -319,7 +418,18 @@ template <class Tag> struct Ops {
 
     static int available() { return bound.load() && env.table && env.count && (!env.enabled || env.enabled()) ? 1 : 0; }
 
-    static bool ready(const Field &f) { return !f.needs || !env.row_ready || env.row_ready(f.needs); }
+    static bool ready(const Field &f)
+    {
+        if (f.needs && env.row_ready && !env.row_ready(f.needs))
+            return false;
+        if (f.kind == Kind::cell && env.row_ready)
+            for (const char *row : RACECRAFT_ROWS)
+                if (!env.row_ready(row))
+                    return false;
+        return true;
+    }
+
+    static ai_racecraft::Mem cell_mem() { return {env.read, env.write}; }
 
     static int cars(uint32_t &n)
     {
@@ -358,7 +468,7 @@ template <class Tag> struct Ops {
     // The address of a field's storage on one car; sys is the system the field belongs to (for a rederive).
     static int locate(uintptr_t car, const Field &f, uintptr_t &sys, uintptr_t &at)
     {
-        if (f.kind == Kind::virt)
+        if (f.kind == Kind::virt || f.kind == Kind::cell)
             return SWOFTY_ASSET_UNAVAILABLE;
         if (f.via == Via::system) {
             if (int r = system_at(car, f.system, sys); r != SWOFTY_ASSET_OK)
@@ -514,6 +624,12 @@ template <class Tag> struct Ops {
             *value = virt[index][f->vslot].load();
             return SWOFTY_ASSET_OK;
         }
+        if (f->kind == Kind::cell) {
+            uintptr_t car = 0;
+            if (int r = car_at(index, handle, car); r != SWOFTY_ASSET_OK)
+                return r;
+            return racecraft.read(cell_mem(), index, f->vslot, *value) ? SWOFTY_ASSET_OK : SWOFTY_ASSET_UNAVAILABLE;
+        }
         uintptr_t car = 0, sys = 0, at = 0;
         if (int r = car_at(index, handle, car); r != SWOFTY_ASSET_OK)
             return r;
@@ -581,7 +697,7 @@ template <class Tag> struct Ops {
         const Field *f = field(id);
         if (!f || !std::isfinite(value) || value < f->lo || value > f->hi)
             return SWOFTY_ASSET_INVALID;
-        if (!ready(*f))
+        if (!ready(*f) || f->kind == Kind::cell)
             return SWOFTY_ASSET_UNAVAILABLE;
         if (f->kind == Kind::virt) {
             if (index >= MAX_CARS)
@@ -627,6 +743,31 @@ template <class Tag> struct Ops {
         return x == y;
     }
 
+    // A cell field changes only on the flow thread, with the AI system settled (ai_racecraft.hpp); anything else waits
+    // for the next apply.
+    static void apply_cell(uint32_t index, const Field &f, bool want, const std::vector<LayerRec> &mine)
+    {
+        if (!want && !racecraft.swapped(index, f.vslot))
+            return;
+        if (!ready(f))
+            return;
+        if (env.flow_thread && !env.flow_thread()) {
+            dirty = true;
+            return;
+        }
+        racecraft.apply(cell_mem(), index, f.vslot, want,
+                        [&](float base) { return clamp(f, composed_of(mine, f, base)); });
+    }
+
+    // The core's handlers: the AI system built (site_Ai_BuildSystem_RecordPushed), a frame, a new session.
+    static void racecraft_pushed(uintptr_t system) { racecraft.pushed(cell_mem(), system); }
+    static void racecraft_forget() { racecraft.forget(); }
+    static void racecraft_tick()
+    {
+        if (racecraft.tick(cell_mem()))
+            dirty = true;
+    }
+
     // Applies every layer that matches one car now. A memory field's base is the value the game last wrote: the
     // value read is the game's when it differs from what this wrote, so a reset (which restores the game's value)
     // is picked up as the new base, and a layer applied twice does not compound.
@@ -643,6 +784,10 @@ template <class Tag> struct Ops {
             if (f.kind == Kind::virt)
                 continue;
             bool want = std::any_of(mine.begin(), mine.end(), [&](const LayerRec &l) { return l.field == f.id; });
+            if (f.kind == Kind::cell) {
+                apply_cell(index, f, want, mine);
+                continue;
+            }
             Slot &s = slots[index][i];
             if (!want && !s.valid)
                 continue;
