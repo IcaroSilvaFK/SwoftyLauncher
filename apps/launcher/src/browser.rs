@@ -184,12 +184,16 @@ impl Progress {
                     Some(item) => format!("Downloading {item} · "),
                     None => "Downloading ".to_owned(),
                 };
-                text.push_str(&format!(
-                    "{} of {} · {:.0}%",
-                    size_text(done),
-                    size_text(size),
-                    self.fraction() * 100.
-                ));
+                if size == 0 {
+                    text.push_str(&size_text(done));
+                } else {
+                    text.push_str(&format!(
+                        "{} of {} · {:.0}%",
+                        size_text(done),
+                        size_text(size),
+                        self.fraction() * 100.
+                    ));
+                }
                 if rate > 0. {
                     text.push_str(&format!(" · {}/s", size_text(rate as u64)));
                 }
@@ -207,6 +211,78 @@ impl Progress {
     }
 }
 
+fn install_failure_title(name: &str, verb: &str, refused: bool) -> String {
+    if refused {
+        format!("Can't {verb} {name}: missing requirements")
+    } else {
+        format!("Could not {verb} {name}")
+    }
+}
+
+fn install_failure_toast(name: &str, verb: &str, refused: bool, error: String) -> Notification {
+    Notification::error(error).title(install_failure_title(name, verb, refused))
+}
+
+fn requested_version_available(addon: Option<&Addon>, requested: &catalog::Version) -> bool {
+    addon.is_some_and(|addon| {
+        addon.listed().iter().any(|version| {
+            version.version == requested.version
+                && version.accepts(&current_version())
+                && version.sha256 == requested.sha256
+                && version.size == requested.size
+                && version.url == requested.url
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryAction {
+    Retry,
+    RequestCurrent,
+    Unavailable,
+}
+
+fn retry_action(addon: Option<&Addon>, requested: &catalog::Version) -> RetryAction {
+    if requested_version_available(addon, requested) {
+        RetryAction::Retry
+    } else if addon.and_then(|a| a.offered(&current_version())).is_some() {
+        RetryAction::RequestCurrent
+    } else {
+        RetryAction::Unavailable
+    }
+}
+
+/// Minimal identity for an update that disappeared from the current catalog.
+fn update_identity(update: &Update) -> Addon {
+    Addon {
+        id: update.id.clone(),
+        name: update.name.clone(),
+        author: String::new(),
+        summary: String::new(),
+        description: String::new(),
+        category: None,
+        kind: Vec::new(),
+        homepage: None,
+        icon: None,
+        publisher: None,
+        publishers: Vec::new(),
+        downloads: 0,
+        downloads_30d: 0,
+        stars: 0,
+        trend: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        latest: None,
+        versions: Vec::new(),
+    }
+}
+
+/// Whether a held update represents a real failure rather than a successful
+/// install waiting for the asynchronous catalog refresh.
+fn held_failure(error: &str) -> bool {
+    !error.is_empty()
+}
+
 /// An install's downloads so far: every addon it fetches, requirements included.
 #[derive(Default)]
 struct Tally {
@@ -216,6 +292,7 @@ struct Tally {
     stage: u8,
     item: Option<String>,
     also: Vec<String>,
+    installed: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -249,7 +326,7 @@ impl Job {
                 let secs = self.started.elapsed().as_secs_f64();
                 Progress::Downloading {
                     done,
-                    size: t.size.max(done),
+                    size: t.size,
                     rate: if secs > 0.3 { done as f64 / secs } else { 0. },
                 }
             }
@@ -264,6 +341,15 @@ impl Job {
     /// The other addons it installs, once they're known.
     fn also(&self) -> Vec<String> {
         self.tally().also.clone()
+    }
+
+    fn failure(&self, error: &str) -> String {
+        let installed = self.tally().installed.clone();
+        if installed.is_empty() {
+            error.to_owned()
+        } else {
+            format!("{error} · Already installed: {}", installed.join(", "))
+        }
     }
 
     fn track(&self, root: &str, e: Event) {
@@ -282,6 +368,8 @@ impl Job {
             Event::Stage(Stage::Downloading(n)) => t.current = n,
             Event::Stage(Stage::Verifying) => t.stage = VERIFYING,
             Event::Stage(Stage::Installing) => t.stage = INSTALLING,
+            Event::Installed(m) if m.id != root => t.installed.push(format!("{} {}", m.name, m.version)),
+            Event::Installed(_) => {}
         }
     }
 }
@@ -294,6 +382,7 @@ enum Offer {
     Elsewhere,
     Update(semver::Version, semver::Version),
     TooOld,
+    Queued,
     Working(Progress),
     Failed,
     /// Not installed, and its requirements can't all be met.
@@ -652,6 +741,7 @@ pub(crate) struct Browser {
     asked: HashSet<String>,
     history: HashSet<String>,
     working: HashMap<String, Job>,
+    queue: crate::download_queue::Queue<(Addon, catalog::Version, String)>,
     failed: HashMap<String, String>,
     refused: BTreeSet<String>,
     batch: Option<Batch>,
@@ -716,6 +806,11 @@ impl Browser {
             asked: HashSet::new(),
             history: HashSet::new(),
             working: HashMap::new(),
+            queue: {
+                let mut queue = crate::download_queue::Queue::default();
+                queue.set_limit(swofty_core::store::Store::new(root).config().download_jobs());
+                queue
+            },
             failed: HashMap::new(),
             refused: BTreeSet::new(),
             batch: None,
@@ -1056,6 +1151,15 @@ impl Shell {
         if let Some(job) = self.browser.working.get(&a.id) {
             return Offer::Working(job.progress());
         }
+        if self
+            .browser
+            .queue
+            .jobs()
+            .iter()
+            .any(|job| job.id == a.id && job.state == crate::download_queue::State::Queued)
+        {
+            return Offer::Queued;
+        }
         if self.browser.failed.contains_key(&a.id) {
             return Offer::Failed;
         }
@@ -1138,21 +1242,313 @@ impl Shell {
     }
 
     pub(crate) fn install_from_catalog(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.browser.working.contains_key(id) {
-            return;
-        }
+        self.enqueue_catalog(id, cx);
+    }
+
+    /// True when a job was queued or an existing pending job will handle it.
+    fn enqueue_catalog(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         let Some(addon) = self.browser.find(id).cloned() else {
-            return;
+            return false;
         };
         let Some(version) = addon.offered(&current_version()).cloned() else {
-            return;
+            return false;
         };
         if self.build.as_ref().is_some_and(|b| b.holds(id)) {
             self.browser
                 .toasts
                 .push(Notification::warning(crate::update::BUILDING));
+            return false;
+        }
+        if let Some(existing) = self.browser.queue.jobs().iter().find(|job| {
+            job.id == id
+                && matches!(
+                    job.state,
+                    crate::download_queue::State::Queued | crate::download_queue::State::Active
+                )
+        }) {
+            return existing.request.1 == version;
+        }
+        let claims = match self.requirements(&addon) {
+            Some(Ok(plan)) => plan.also().iter().map(|s| s.addon.id.clone()).collect(),
+            _ => BTreeSet::new(),
+        };
+        if self.browser.queue.enqueue(
+            id.to_owned(),
+            (addon, version, self.library.profile.name.clone()),
+            claims,
+        ) {
+            self.start_queued_downloads(cx);
+        }
+        true
+    }
+
+    pub(crate) fn download_pending(&self) -> usize {
+        self.browser.queue.pending()
+    }
+
+    pub(crate) fn downloads_page(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        use crate::download_queue::State;
+        let rows = self
+            .browser
+            .queue
+            .jobs()
+            .iter()
+            .enumerate()
+            .map(|(index, job)| {
+                let id = job.id.clone();
+                let status = match &job.state {
+                    State::Queued => "Queued".to_owned(),
+                    State::Active => self.browser.working.get(&id).map_or_else(
+                        || "Starting…".to_owned(),
+                        |progress| progress.progress().long(progress.item().as_deref()),
+                    ),
+                    State::Completed => "Completed".to_owned(),
+                    State::Failed(error) => format!("Failed: {error}"),
+                };
+                let status = if matches!(job.state, State::Completed | State::Failed(_))
+                    && self
+                        .store
+                        .profile_names()
+                        .is_ok_and(|names| !names.contains(&job.request.2))
+                {
+                    format!(
+                        "{status} · Profile {} no longer exists; nothing was added to another profile.",
+                        job.request.2
+                    )
+                } else {
+                    status
+                };
+                let action = match &job.state {
+                    State::Queued => {
+                        let target = id.clone();
+                        Some(
+                            Button::new(SharedString::from(format!("remove-{id}-{index}")))
+                                .label("Remove")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.browser.queue.remove_queued(&target) {
+                                        if let Some(batch) = &mut this.browser.batch {
+                                            batch.left.remove(&target);
+                                        }
+                                        if this.browser.batch.as_ref().is_some_and(|b| b.left.is_empty()) {
+                                            this.finish_addon_updates();
+                                        }
+                                        this.start_queued_downloads(cx);
+                                    }
+                                })),
+                        )
+                    }
+                    State::Failed(_) => {
+                        let target = id.clone();
+                        let action = retry_action(self.browser.find(&id), &job.request.1);
+                        let pending = self.browser.queue.jobs().iter().any(|other| {
+                            other.id == id && matches!(other.state, State::Queued | State::Active)
+                        });
+                        Some(
+                            Button::new(SharedString::from(format!("retry-{id}-{index}")))
+                                .label(if pending {
+                                    "Already queued"
+                                } else {
+                                    match action {
+                                        RetryAction::Retry => "Retry",
+                                        RetryAction::RequestCurrent => "Request current version",
+                                        RetryAction::Unavailable => "Version unavailable",
+                                    }
+                                })
+                                .disabled(pending || action == RetryAction::Unavailable)
+                                .on_click(cx.listener(move |this, _, _, cx| match action {
+                                    RetryAction::Retry => {
+                                        if this.browser.queue.retry_at(index, &target) {
+                                            this.start_queued_downloads(cx);
+                                        }
+                                    }
+                                    RetryAction::RequestCurrent => {
+                                        this.enqueue_catalog(&target, cx);
+                                    }
+                                    RetryAction::Unavailable => {}
+                                })),
+                        )
+                    }
+                    _ => None,
+                };
+                v_flex()
+                    .gap(px(4.))
+                    .p(px(12.))
+                    .bg(p.surface)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(format!("{} {}", job.request.0.name, job.request.1.version))
+                            .children(action),
+                    )
+                    .child(div().text_color(p.text_muted).child(status))
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .size_full()
+            .p(px(24.))
+            .gap(px(12.))
+            .child(
+                h_flex().justify_between().child("Downloads").child(
+                    Button::new("clear-downloads")
+                        .label("Clear finished")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let finished: Vec<_> = this
+                                .browser
+                                .queue
+                                .jobs()
+                                .iter()
+                                .filter(|job| matches!(job.state, crate::download_queue::State::Failed(_)))
+                                .map(|job| job.id.clone())
+                                .collect();
+                            this.browser.queue.clear_finished();
+                            for id in finished {
+                                if !this.browser.queue.jobs().iter().any(|job| job.id == id) {
+                                    this.browser.failed.remove(&id);
+                                    this.browser.refused.remove(&id);
+                                }
+                            }
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child("Concurrent jobs")
+                    .child(
+                        Button::new("download-limit-minus")
+                            .label("−")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.change_download_limit(this.browser.queue.limit().saturating_sub(1), cx);
+                            })),
+                    )
+                    .child(self.browser.queue.limit().to_string())
+                    .child(
+                        Button::new("download-limit-plus")
+                            .label("+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.change_download_limit(this.browser.queue.limit() + 1, cx);
+                            })),
+                    ),
+            )
+            .children(rows.is_empty().then(|| {
+                v_flex().gap(px(8.)).child("No downloads yet").child(
+                    Button::new("open-addon-browser")
+                        .label("Browse addons")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_page(Page::Browser, cx))),
+                )
+            }))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .scroll_y("downloads-list")
+                    .gap(px(8.))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn retry_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        let index =
+            self.browser.queue.jobs().iter().rposition(|job| {
+                job.id == id && matches!(job.state, crate::download_queue::State::Failed(_))
+            });
+        if let Some(index) = index {
+            let action = retry_action(self.browser.find(id), &self.browser.queue.jobs()[index].request.1);
+            if action == RetryAction::RequestCurrent {
+                self.enqueue_catalog(id, cx);
+            } else if action == RetryAction::Retry && self.browser.queue.retry_at(index, id) {
+                self.browser.failed.remove(id);
+                self.browser.refused.remove(id);
+                self.start_queued_downloads(cx);
+            }
+        } else {
+            self.install_from_catalog(id, cx);
+        }
+    }
+
+    fn change_download_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
+        let mut config = self.store.config();
+        config.set_download_jobs(limit);
+        if let Err(error) = self.store.save_config(&config) {
+            crate::app_log::action("save download limit").failed(&error);
             return;
         }
+        self.browser.queue.set_limit(config.download_jobs());
+        self.start_queued_downloads(cx);
+    }
+
+    fn start_queued_downloads(&mut self, cx: &mut Context<Self>) {
+        let queued: Vec<_> = self
+            .browser
+            .queue
+            .jobs()
+            .iter()
+            .filter(|job| job.state == crate::download_queue::State::Queued)
+            .map(|job| (job.id.clone(), job.request.0.clone()))
+            .collect();
+        for (id, addon) in queued {
+            if let Some(Ok(plan)) = self.requirements(&addon) {
+                self.browser
+                    .queue
+                    .update_claims(&id, plan.also().iter().map(|s| s.addon.id.clone()).collect());
+            }
+        }
+        while let Some(id) = self.browser.queue.start_next() {
+            let (addon, version, profile) = self
+                .browser
+                .queue
+                .jobs()
+                .iter()
+                .find(|job| job.id == id && job.state == crate::download_queue::State::Active)
+                .expect("the scheduler just activated this job")
+                .request
+                .clone();
+            if !requested_version_available(self.browser.find(&id), &version) {
+                let error = format!(
+                    "{} {} is no longer available or compatible; request it again.",
+                    addon.name, version.version
+                );
+                self.browser.queue.finish(&id, Err(error.clone()));
+                self.browser.failed.insert(id.clone(), error.clone());
+                if let Some(batch) = &mut self.browser.batch
+                    && batch.left.remove(&id)
+                {
+                    batch.failed.push((addon.name.clone(), error));
+                } else {
+                    let verb = if self.installed_version(&id).is_some() {
+                        "update"
+                    } else {
+                        "install"
+                    };
+                    self.browser
+                        .toasts
+                        .push(install_failure_toast(&addon.name, verb, false, error));
+                }
+                if self
+                    .browser
+                    .batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.left.is_empty())
+                {
+                    self.finish_addon_updates();
+                }
+                continue;
+            }
+            self.start_catalog_install(addon, version, profile, cx);
+        }
+        cx.notify();
+    }
+
+    fn start_catalog_install(
+        &mut self,
+        addon: Addon,
+        version: catalog::Version,
+        profile: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = addon.id.as_str();
         let updating = self.installed_version(id).is_some();
         self.browser.failed.remove(id);
         self.browser.refused.remove(id);
@@ -1186,12 +1582,13 @@ impl Shell {
         let store = self.store.clone();
         let catalog_now = self.browser.addons.clone();
         let started = Instant::now();
+        let tracked = job.clone();
         cx.spawn(async move |this, cx| {
             let (target, v) = (addon.clone(), version.clone());
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    catalog::requires::install(&store, &catalog_now, &target, &v, &|e| {
+                    catalog::requires::install_in_profile(&store, &catalog_now, &target, &v, &profile, &|e| {
                         job.track(&target.id, e)
                     })
                 })
@@ -1202,6 +1599,13 @@ impl Shell {
                     s.browser.working.remove(d);
                 }
                 let took = started.elapsed();
+                s.browser.queue.finish(
+                    &addon.id,
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| tracked.failure(&error.to_string())),
+                );
                 let in_batch = s.browser.batch.as_mut().is_some_and(|b| b.left.remove(&addon.id));
                 let verb = if updating { "update" } else { "install" };
                 match result {
@@ -1225,18 +1629,11 @@ impl Shell {
                             if let Some(b) = s.browser.batch.as_mut() {
                                 b.updated.push(format!("{} {}", m.name, m.version));
                             }
-                        } else {
-                            if s.page == Page::Browser {
-                                s.show_installed(&m.id, cx);
-                            }
-                            if !also.is_empty() {
-                                s.browser.toasts.push(
-                                    Notification::success(format!("Also installed {}", also.join(", ")))
-                                        .title(title),
-                                );
-                            } else if s.page != Page::Browser {
-                                s.browser.toasts.push(Notification::success(title));
-                            }
+                        } else if !also.is_empty() {
+                            s.browser.toasts.push(
+                                Notification::success(format!("Also installed {}", also.join(", ")))
+                                    .title(title),
+                            );
                         }
                     }
                     Err(e) => {
@@ -1261,22 +1658,21 @@ impl Shell {
                         } else {
                             s.browser
                                 .toasts
-                                .push(Notification::error(error).title(if refused {
-                                    format!("Can't {verb} {}: missing requirements", addon.name)
-                                } else {
-                                    format!("Could not {verb} {}", addon.name)
-                                }));
+                                .push(install_failure_toast(&addon.name, verb, refused, error));
                         }
                         s.reload(cx);
                     }
                 }
-                if in_batch && let Some(to) = s.catalog_update(&addon.id).map(|u| u.to.version.clone()) {
+                if in_batch {
                     let error = s.browser.failed.get(&addon.id).cloned().unwrap_or_default();
-                    s.browser.held.insert(addon.id.clone(), (to, error));
+                    s.browser
+                        .held
+                        .insert(addon.id.clone(), (version.version.clone(), error));
                 }
                 if in_batch && s.browser.batch.as_ref().is_some_and(|b| b.left.is_empty()) {
                     s.finish_addon_updates();
                 }
+                s.start_queued_downloads(cx);
                 cx.notify();
             })
             .ok();
@@ -1284,15 +1680,6 @@ impl Shell {
         .detach();
         self.tick_browser(cx);
         cx.notify();
-    }
-
-    /// Opens where `id` now lists, highlighting it: Addons, or Tracks for a track addon.
-    fn show_installed(&mut self, id: &str, cx: &mut Context<Self>) {
-        let track = self.library.addons.iter().any(|a| a.manifest.id == id && a.track);
-        match self.library.tracks_page.filter(|_| track) {
-            Some(i) => self.open_page(Page::Section(i), cx),
-            None => self.show_addon(id, cx),
-        }
     }
 
     /// The addon updates the play bar offers: every outdated registry addon that's on in the active
@@ -1329,25 +1716,50 @@ impl Shell {
             return;
         }
         let building = self.build.clone();
-        let (held, ids): (Vec<String>, Vec<String>) = self
+        let (held, updates): (Vec<Update>, Vec<Update>) = self
             .addon_updates()
             .into_iter()
-            .map(|u| u.id.clone())
-            .filter(|id| !self.browser.working.contains_key(id))
-            .partition(|id| building.as_ref().is_some_and(|b| b.holds(id)));
+            .cloned()
+            .partition(|u| building.as_ref().is_some_and(|b| b.holds(&u.id)));
         if !held.is_empty() {
             window.push_notification(Notification::warning(crate::update::BUILDING), cx);
         }
-        if ids.is_empty() || self.updating_addons() {
+        if updates.is_empty() || self.updating_addons() {
             return;
         }
+        let ids: Vec<_> = updates.iter().map(|u| u.id.clone()).collect();
         catalog::log(&self.store.root, &format!("updating addons: {}", ids.join(", ")));
         self.browser.batch = Some(Batch {
-            left: ids.iter().cloned().collect(),
+            left: ids.into_iter().collect(),
             ..Batch::default()
         });
-        for id in ids {
-            self.install_from_catalog(&id, cx);
+        for update in updates {
+            if !self.enqueue_catalog(&update.id, cx) {
+                let error =
+                    "This update is no longer available or another version is already queued.".to_owned();
+                let addon = self
+                    .browser
+                    .find(&update.id)
+                    .cloned()
+                    .unwrap_or_else(|| update_identity(&update));
+                self.browser.queue.record_failure(
+                    update.id.clone(),
+                    (addon, update.to.clone(), self.library.profile.name.clone()),
+                    error.clone(),
+                );
+                if let Some(batch) = &mut self.browser.batch {
+                    batch.left.remove(&update.id);
+                    batch.failed.push((update.name, error));
+                }
+            }
+        }
+        if self
+            .browser
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.left.is_empty())
+        {
+            self.finish_addon_updates();
         }
     }
 
@@ -1508,7 +1920,9 @@ impl Shell {
             .browser
             .held
             .iter()
-            .filter(|(id, (v, _))| self.catalog_update(id).is_some_and(|u| u.to.version == *v))
+            .filter(|(id, (v, error))| {
+                held_failure(error) && self.catalog_update(id).is_some_and(|u| u.to.version == *v)
+            })
             .map(|(id, (_, e))| {
                 let name = self.browser.find(id).map_or(id.as_str(), |a| a.name.as_str());
                 format!("{name}: {e}")
@@ -1624,7 +2038,16 @@ impl Shell {
                     .label(format!("Installed v{from} · v{to} in the play bar"))
                     .disabled(true);
             }
-            Offer::Failed => button.danger().icon(IconName::RotateCw).label("Failed – Retry"),
+            Offer::Failed => {
+                return button
+                    .danger()
+                    .icon(IconName::RotateCw)
+                    .label("Failed – Retry")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.retry_download(&target, cx);
+                    }));
+            }
             Offer::Installed(v) => {
                 return button
                     .outline()
@@ -1652,6 +2075,15 @@ impl Shell {
                     .icon(IconName::TriangleAlert)
                     .label("Missing requirements")
                     .disabled(true);
+            }
+            Offer::Queued => {
+                return button
+                    .outline()
+                    .label("Queued · View downloads")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_page(Page::Downloads, cx);
+                    }));
             }
             Offer::Working(progress) => {
                 return button
@@ -3757,6 +4189,87 @@ mod tests {
     }
 
     #[test]
+    fn queued_install_reports_partial_failure_and_retries_without_duplication() {
+        use crate::download_queue::{Queue, State};
+        use std::collections::BTreeSet;
+        let mut queue = Queue::default();
+        assert!(queue.enqueue("root".into(), "1.0.0", BTreeSet::new()));
+        assert!(!queue.enqueue("root".into(), "2.0.0", BTreeSet::new()));
+        assert_eq!(queue.start_next().as_deref(), Some("root"));
+        let job = Job::new(100);
+        let dependency: swofty_core::manifest::AddonManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "id": "dep", "name": "Dependency", "version": "1.0.0",
+            "author": "test", "compat": {"game": "f1_25"}
+        }))
+        .unwrap();
+        job.track("root", Event::Installed(&dependency));
+        assert!(queue.finish("root", Err(job.failure("root failed"))));
+        assert!(matches!(&queue.jobs()[0].state, State::Failed(message)
+            if message.contains("root failed") && message.contains("Dependency 1.0.0")));
+        assert!(queue.retry_at(0, "root"));
+        assert_eq!(queue.jobs()[0].request, "1.0.0");
+        assert!(matches!(queue.jobs()[0].state, State::Queued));
+        assert_eq!(queue.start_next().as_deref(), Some("root"));
+        assert!(queue.finish("root", Ok(())));
+        assert_eq!(queue.pending(), 0);
+        assert!(matches!(queue.jobs()[0].state, State::Completed));
+    }
+
+    #[test]
+    fn retry_action_distinguishes_original_and_current_versions() {
+        use super::RetryAction;
+        let old = step("test.addon", 100);
+        let mut addon = old.addon.clone();
+        addon.versions = vec![old.version.clone()];
+        assert_eq!(
+            super::retry_action(Some(&addon), &old.version),
+            RetryAction::Retry
+        );
+        addon.versions[0].yanked = true;
+        assert_eq!(
+            super::retry_action(Some(&addon), &old.version),
+            RetryAction::Unavailable
+        );
+        let mut newer = old.version.clone();
+        newer.version = "2.0.0".parse().unwrap();
+        addon.versions.push(newer);
+        assert_eq!(
+            super::retry_action(Some(&addon), &old.version),
+            RetryAction::RequestCurrent
+        );
+        assert_eq!(super::retry_action(None, &old.version), RetryAction::Unavailable);
+    }
+
+    #[test]
+    fn queued_version_must_remain_available_and_unchanged() {
+        let requested = step("test.addon", 100);
+        let mut addon = requested.addon.clone();
+        addon.versions = vec![requested.version.clone()];
+        assert!(super::requested_version_available(
+            Some(&addon),
+            &requested.version
+        ));
+        assert!(!super::requested_version_available(None, &requested.version));
+        addon.versions[0].yanked = true;
+        assert!(!super::requested_version_available(
+            Some(&addon),
+            &requested.version
+        ));
+        addon.versions[0].yanked = false;
+        addon.versions[0].sha256 = "changed".into();
+        assert!(!super::requested_version_available(
+            Some(&addon),
+            &requested.version
+        ));
+        addon.versions[0] = requested.version.clone();
+        addon.versions[0].launcher = Some(">=999.0.0".parse().unwrap());
+        assert!(!super::requested_version_available(
+            Some(&addon),
+            &requested.version
+        ));
+    }
+
+    #[test]
     fn tallies_every_download_of_an_install() {
         let (dep, root) = (step("dep", 300), step("root", 100));
         let job = Job::new(100);
@@ -3861,6 +4374,24 @@ mod tests {
         let due = due_updates(&updates, &on, &BTreeMap::new());
         assert_eq!(due.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), ["on"]);
         assert!(due_updates(&updates, &HashSet::new(), &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_successfully_updated_addon_is_not_reported_as_failed_during_refresh() {
+        assert!(!super::held_failure(""));
+        assert!(super::held_failure("network error"));
+    }
+
+    #[test]
+    fn failed_install_toast_title_names_the_addon() {
+        assert_eq!(
+            super::install_failure_title("Foo", "install", false),
+            "Could not install Foo"
+        );
+        assert_eq!(
+            super::install_failure_title("Foo", "update", true),
+            "Can't update Foo: missing requirements"
+        );
     }
 
     #[test]
